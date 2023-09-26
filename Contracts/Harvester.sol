@@ -1,209 +1,233 @@
 // SPDX-License-Identifier: MIT
+/**
+ * @title Incentivizer Contract
+ */
 pragma solidity ^0.8.17;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "abdk-libraries-solidity/ABDKMath64x64.sol";
 
-interface IBattledog {
-    struct Player {
-        string name;
-        uint256 id;
-        uint256 level;
-        uint256 attack;
-        uint256 defence;
-        uint256 fights;
-        uint256 wins;
-        uint256 payout;
-        uint256 activate;
-        uint256 history;
-    }
 
-    function getPlayers() external view returns (Player[] memory);
-    function getPlayerOwners(address _user) external returns (Player[] memory);
-    function blacklisted(uint256 _index) external view returns (bool);
-}
-
-/**
- * @title Proof of Play Miner contract
- */
-contract ProofOfPlay is Ownable, ReentrancyGuard {
+contract Harvester is Ownable, ReentrancyGuard {
     IERC20 public GAMEToken;
+    IERC20 public payToken;
+    uint256 public totalRewards = 1;
     uint256 public totalClaimedRewards;
-    uint256 public multiplier = 10;
-    uint256 public timeLock = 24 hours;
-    uint256 private divisor = 1 ether;
+    uint256 public startTime;
+    uint256 public rewardPerStamp;
+    uint256 public numberOfParticipants = 0;
+    uint256 public Duration = 604800;
+    uint256 public timeLock = 5;
+    uint256 public TotalGAMESent = 1;
+    uint256 public tax = 0;
+    uint256 public TaxTotal = 0;
+    uint256 private divisor = 100 ether;
     address private guard; 
-    address public battledogs;
     bool public paused = false; 
-    uint256 public activatebonus = 5;
-    uint256 public levelbonus = 4;
-    uint256 public winsbonus = 3;
-    uint256 public fightsbonus = 2;
-    uint256 public historybonus = 1;
-        
 
-    // Declare the ActiveMiners & Blacklist arrays
-    uint256 public activeMinersLength;
+    mapping(address => uint256) public balances;
+    mapping(address => Claim) public claimRewards;
+    mapping(address => uint256) public entryMap;
+    mapping(address => uint256) public UserClaims;
+    mapping(address => uint256) public blacklist;
+    mapping(address => uint256) public Claimants;
 
-    mapping(uint256 => IBattledog.Player) public ActiveMiners;
-    mapping(uint256 => Miner) public Collectors;
-    mapping(uint256 => uint256) public MinerClaims;
+    address[] public participants;
 
-
-    struct Miner {
-        string name;
-        uint256 id;
-        uint256 level;
-        uint256 attack;
-        uint256 defence;
-        uint256 fights;
-        uint256 wins;
-        uint256 payout;
-        uint256 activate;
-        uint256 history;
+    struct Claim {
+        uint256 eraAtBlock;
+        uint256 GAMESent;
+        uint256 rewardsOwed;
     }
-
-    event RewardClaimedByMiner (address indexed user, uint256 amount);
+    
+    event RewardsUpdated(uint256 totalRewards);
+    event RewardAddedByDev(uint256 amount);
+    event RewardClaimedByUser(address indexed user, uint256 amount);
+    event AddGAME(address indexed user, uint256 amount);
+    event WithdrawGAME(address indexed user, uint256 amount);
     
     constructor(
         address _GAMEToken,
-        address _battledogs,
+        address _payToken,
         address _newGuard
     ) {
         GAMEToken = IERC20(_GAMEToken);
-        battledogs = _battledogs;
+        payToken = IERC20(_payToken);
         guard = _newGuard;
+        startTime = block.timestamp;
     }
-
-    using ABDKMath64x64 for uint256;  
 
     modifier onlyGuard() {
         require(msg.sender == guard, "Not authorized.");
         _;
     }
 
-    function getMinerData() public nonReentrant {
-        IBattledog.Player[] memory players = IBattledog(battledogs).getPlayers();
-        activeMinersLength = players.length;
+    modifier onlyAfterTimelock() {             
+        require(entryMap[msg.sender] + timeLock < block.timestamp, "Timelocked.");
+        _;
+    }
 
-        for (uint256 i = 0; i < players.length; i++) {
-            ActiveMiners[i] = players[i];
+    modifier onlyClaimant() {             
+        require(UserClaims[msg.sender] + timeLock < block.timestamp, "Timelocked.");
+        _;
+    }
+
+    function addGAME(uint256 _amount) public nonReentrant {
+        require(!paused, "Contract is paused.");
+        require(_amount > 0, "Amount must be greater than zero.");
+        require(blacklist[msg.sender] == 0, "Address is blacklisted.");
+        require(GAMEToken.transferFrom(msg.sender, address(this), _amount), "Transfer failed.");
+        Claim storage claimData = claimRewards[msg.sender];
+        uint256 toll = (_amount * tax)/100;
+        uint256 amount = _amount - toll;
+        TaxTotal += toll;
+        uint256 currentBalance = balances[msg.sender];
+        uint256 newBalance = currentBalance + amount;
+        balances[msg.sender] = newBalance;
+        entryMap[msg.sender] = block.timestamp; // record the user's entry timestamp
+
+        if (currentBalance == 0) {
+            numberOfParticipants += 1;
+            participants.push(msg.sender);
+        } else {
+            updateAllClaims();
         }
+    
+        claimData.eraAtBlock = block.timestamp;
+        claimData.GAMESent += amount;
+        TotalGAMESent += amount;
+        setRewards();
+        emit AddGAME(msg.sender, _amount);
     }
 
-    function getActiveMiner(uint256 index) public view returns (IBattledog.Player memory) {
-        require(index < activeMinersLength, "Index out of range.");
-        return ActiveMiners[index];
+    /**
+    * @dev Allows the user to withdraw their GAME tokens
+    */
+    function withdrawGAME() public nonReentrant onlyAfterTimelock {
+        require(!paused, "Contract already paused.");
+        require(balances[msg.sender] > 0, "No GAME tokens to withdraw.");        
+        uint256 GAMEAmount = balances[msg.sender];
+        require(GAMEToken.transfer(msg.sender, GAMEAmount), "Failed Transfer");  
+        
+        updateAllClaims();     
+         //Delete all allocations of GAME
+        balances[msg.sender] = 0;
+        TotalGAMESent -= GAMEAmount;
+        Claim storage claimData = claimRewards[msg.sender];
+        claimData.GAMESent = 0;
+
+       setRewards();
+
+        if (numberOfParticipants > 0) {
+            numberOfParticipants -= 1;
+            entryMap[msg.sender] = 0; // reset the user's entry timestamp
+        }
+        
+        emit WithdrawGAME(msg.sender, GAMEAmount);
     }
 
-    function getOwnerData(uint256 _tokenId) internal returns (bool) {        
-    // Get the Player structs owned by the msg.sender
-    IBattledog.Player[] memory owners = IBattledog(battledogs).getPlayerOwners(msg.sender);
+    /**
+    * @dev Adds new rewards to the contract
+    * @param _amount The amount of rewards to add
+    */
+    function addRewards(uint256 _amount) external onlyOwner {
+        payToken.transferFrom(msg.sender, address(this), _amount);
+        setRewards();
+        emit RewardAddedByDev(_amount);
+    }
 
-    // Iterate through the stored Player structs and compare the _tokenId with the id of each Player struct
-        for (uint256 i = 0; i < owners.length; i++) {
-            if (owners[i].id == _tokenId) {
-                return true;
+    function setRewards() internal {
+        totalRewards = payToken.balanceOf(address(this));
+        updateRewardPerStamp();
+        emit RewardsUpdated(totalRewards);
+    }
+
+    function updateAllClaims() internal {
+        uint256 numOfParticipants = participants.length;
+        for (uint i = 0; i < numOfParticipants; i++) {
+            address participant = participants[i];
+            Claim storage claimData = claimRewards[participant];
+            uint256 currentTime = block.timestamp;
+            uint256 period = block.timestamp - claimData.eraAtBlock;
+            
+            if (blacklist[participant] == 1) {
+                claimData.rewardsOwed = 0;
+            } else {
+                uint256 rewardsAccrued = claimData.rewardsOwed + (rewardPerStamp * period * claimData.GAMESent);
+                claimData.rewardsOwed = rewardsAccrued;
             }
+            claimData.eraAtBlock = currentTime;
         }
-        return false;
     }
 
-    function mineGAME(uint256 _tokenId) public nonReentrant {
-        //Require Contract isn't paused
-        require(!paused, "Paused Contract");
-        //Require Token Ownership    
-        require(getOwnerData(_tokenId), "Not Owner!");        
-        //Require Miner hasn't claimed within 24hrs
-        require(MinerClaims[_tokenId] + timeLock < block.timestamp, "Timelocked.");
-        //Require Miner is not on blacklist
-        require(!IBattledog(battledogs).blacklisted(_tokenId), "NFT Blacklisted");       
-
-    // if statement may work here 
-     if (ActiveMiners[_tokenId].activate > 0) {
-            //Reorg ActiveMiners array
-        IBattledog.Player[] memory players = IBattledog(battledogs).getPlayers();
-                activeMinersLength = players.length;
-
-                for (uint256 i = 0; i < players.length; i++) {
-                    ActiveMiners[i] = players[i];
-                }
-
-        //Calculate Rewards
-        uint256 activatefactor = ActiveMiners[_tokenId].activate * activatebonus;
-        uint256 activate = ActiveMiners[_tokenId].activate * multiplier;
-        uint256 level = ((ActiveMiners[_tokenId].level - Collectors[_tokenId].level) * levelbonus) + activatefactor;
-        uint256 fights = ((ActiveMiners[_tokenId].fights - Collectors[_tokenId].fights) * fightsbonus) + activatefactor;
-        uint256 wins = ((ActiveMiners[_tokenId].wins - Collectors[_tokenId].wins) * winsbonus) + activatefactor;
-        uint256 history = ((ActiveMiners[_tokenId].history - Collectors[_tokenId].history) * historybonus) + activatefactor;
-        uint256 rewards = (activate + level + fights + wins + history) * divisor;
-
-        // Check the contract for adequate withdrawal balance
-        require(GAMEToken.balanceOf(address(this)) > rewards, "Not Enough Reserves");      
-        // Transfer the rewards amount to the miner
-        require(GAMEToken.transfer(msg.sender, rewards), "Failed Transfer.");
-        //Register claim
-        getCollectors(_tokenId);
-        //Register claim timestamp
-        MinerClaims[_tokenId] = block.timestamp; // record the miner's claim timestamp
-        //TotalClaimedRewards
-        totalClaimedRewards += rewards;       
-        //emit event
-        emit RewardClaimedByMiner(msg.sender, rewards);
-     } else {
-        require(ActiveMiners[_tokenId].activate > 0, "ActivateUp Required");
-     }
- 
+    function updateRewardPerStamp() internal {
+        rewardPerStamp = (totalRewards * divisor) / (TotalGAMESent * Duration);
     }
 
-    function getCollectors(uint256 _tokenId) internal {
-        // Read the miner data from the ActiveMiners mapping
-        IBattledog.Player memory activeMiner = ActiveMiners[_tokenId];
+    function claim() public nonReentrant onlyClaimant {  
+        require(!paused, "Contract already paused.");         
+        require(blacklist[msg.sender] == 0, "Address is blacklisted.");        
+        updateAllClaims();          
+        require(claimRewards[msg.sender].rewardsOwed > 0, "No rewards.");
+        Claim storage claimData = claimRewards[msg.sender];
+        uint256 rewards = claimData.rewardsOwed / divisor;
+        require(payToken.transfer(msg.sender, rewards), "Transfer failed.");        
+        claimData.rewardsOwed = 0;
+        // Update the total rewards claimed by the user
+        Claimants[msg.sender] += rewards;
+        totalClaimedRewards += rewards;
+        setRewards();
+        UserClaims[msg.sender] = block.timestamp; // record the user's claim timestamp       
+        emit RewardClaimedByUser(msg.sender, rewards);
+    }
 
-        // Transfer the miner data to the Collectors mapping
-        Collectors[_tokenId] = Miner(
-            activeMiner.name,
-            activeMiner.id,
-            activeMiner.level,
-            activeMiner.attack,
-            activeMiner.defence,
-            activeMiner.fights,
-            activeMiner.wins,
-            activeMiner.payout,
-            activeMiner.activate,
-            activeMiner.history
-        );
+    function withdraw(uint256 _binary, uint256 amount) external onlyOwner {
+        require(amount > 0, "Amount must be greater than zero.");
+        if (_binary > 1) {
+            require(payToken.balanceOf(address(this)) >= amount, "Not Enough Reserves.");
+            require(payToken.transfer(msg.sender, amount), "Transfer failed.");
+        } else {
+            require(amount <= TaxTotal, "Max Exceeded.");
+            require(GAMEToken.balanceOf(address(this)) >= TaxTotal, "Not enough Reserves.");
+            require(GAMEToken.transfer(msg.sender, amount), "Transfer failed.");
+            TaxTotal -= amount;
+        }
+        setRewards();
+    }
+
+    function setDuration(uint256 _seconds) external onlyOwner {        
+        updateAllClaims();
+        Duration = _seconds;
+        updateRewardPerStamp();
     }
 
     function setTimeLock(uint256 _seconds) external onlyOwner {
         timeLock = _seconds;
     }
 
-    function setMultiplier (uint256 _multiples) external onlyOwner() {
-        multiplier = _multiples;
+    function stakeTax (uint256 _percent) external onlyOwner {
+        tax = _percent;
     }
 
-    function setBonuses (uint256 _activate, uint256 _level, uint256 _wins, uint256 _fights, uint256 _history) external onlyOwner() {
-        activatebonus = _activate;
-        levelbonus = _level;
-        winsbonus = _wins;
-        fightsbonus = _fights;
-        historybonus = _history;
+    function setGAMEToken(address _GAMEToken) external onlyOwner {
+        GAMEToken = IERC20(_GAMEToken);
     }
 
-    function setGuard (address _newGuard) external onlyGuard {
-        guard = _newGuard;
+    function setPayToken(address _payToken) external onlyOwner {
+        payToken = IERC20(_payToken);
     }
 
-    function setBattledog (address _battledog) external onlyGuard {
-        battledogs = _battledog;
+    function addToBlacklist(address[] calldata _addresses) external onlyOwner {
+        for (uint256 i = 0; i < _addresses.length; i++) {
+            blacklist[_addresses[i]] = 1;
+        }
     }
 
-    function setGametoken (address _gametoken) external onlyGuard {
-        GAMEToken = IERC20(_gametoken);
+    function removeFromBlacklist(address[] calldata _addresses) external onlyOwner {
+        for (uint256 i = 0; i < _addresses.length; i++) {
+            blacklist[_addresses[i]] = 0;
+        }
     }
 
     event Pause();
@@ -218,5 +242,9 @@ contract ProofOfPlay is Ownable, ReentrancyGuard {
         require(paused, "Contract not paused.");
         paused = false;
         emit Unpause();
-    } 
+    }
+
+    function setGuard (address _newGuard) external onlyGuard {
+        guard = _newGuard;
+    }
 }
