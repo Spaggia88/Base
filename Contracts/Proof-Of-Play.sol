@@ -123,7 +123,7 @@ contract ProofOfPlay is Ownable, ReentrancyGuard {
         require(!IBattledog(battledogs).blacklisted(_tokenId), "NFT Blacklisted");       
 
     // if statement may work here 
-     if (ActiveMiners[_tokenId].activate > 1) {
+     if (ActiveMiners[_tokenId].activate > 0) {
             //Reorg ActiveMiners array
         IBattledog.Player[] memory players = IBattledog(battledogs).getPlayers();
                 activeMinersLength = players.length;
@@ -154,7 +154,7 @@ contract ProofOfPlay is Ownable, ReentrancyGuard {
         //emit event
         emit RewardClaimedByMiner(msg.sender, rewards);
      } else {
-        require(ActiveMiners[_tokenId].attack > 10, "ActivateUp Required");
+        require(ActiveMiners[_tokenId].activate > 0, "ActivateUp Required");
      }
  
     }
