@@ -9,6 +9,7 @@ import "abdk-libraries-solidity/ABDKMath64x64.sol";
 import "./ERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
+
 contract GAME is ERC20, Ownable, ReentrancyGuard {        
         constructor(string memory _name, string memory _symbol, address _newGuard, address _devWallet, address _lpWallet, address _deadWallet) 
             ERC20(_name, _symbol)
@@ -25,10 +26,10 @@ contract GAME is ERC20, Ownable, ReentrancyGuard {
     
     bool public paused = false;
     address private guard;
-    uint256 public MAX_SUPPLY = 5000000000 * 10 ** decimals();
+    uint256 private MAX_SUPPLY = 5000000 * 10 ** decimals();
     uint256 public TotalBurns;
 
-    modifier onlyGuard() {
+    modifier onlyBattledogDAO() {
         require(msg.sender == guard, "Not authorized.");
         _;
     }
@@ -64,14 +65,14 @@ contract GAME is ERC20, Ownable, ReentrancyGuard {
     }
 
     event Pause();
-    function pause() public onlyGuard {
+    function pause() public onlyBattledogDAO {
         require(!paused, "Contract already paused.");
         paused = true;
         emit Pause();
     }
 
     event Unpause();
-    function unpause() public onlyGuard {
+    function unpause() public onlyBattledogDAO {
         require(msg.sender == owner(), "Not Authorized.");
         require(paused, "Contract not paused.");
         paused = false;
@@ -91,7 +92,13 @@ contract GAME is ERC20, Ownable, ReentrancyGuard {
         burnercontract = _burner;
     }
 
-    function setGuard (address _newGuard) external onlyGuard {
+    function setDAO (address _newGuard) external onlyBattledogDAO {
         guard = _newGuard;
+    }
+
+    event limitChangeEvent(uint256 indexed _amount);
+    function setLimit (uint256 _limit) external onlyBattledogDAO {
+        MAX_SUPPLY = _limit;
+        emit limitChangeEvent(_limit);
     }
 }
